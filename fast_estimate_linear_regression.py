@@ -10,7 +10,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import pytorch_lightning as pl
 import torch
 from transformers import T5TokenizerFast, T5ForConditionalGeneration
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, BitsAndBytesConfig, AutoModelForCausalLM
 from peft import get_peft_model, LoraConfig
 
 from src.custom.model import Model
@@ -22,30 +22,36 @@ from sklearn.linear_model import LogisticRegression
 import json
 from evaluation.evaluator import Evaluator
 from evaluation.summary import summarize_evaluation
-
+import time
 
 logging.basicConfig(level=logging.INFO)
 torch.set_float32_matmul_precision("high")
 
 
-def generate_state_dict(model, state_dict, coef, device, removing_keys = ["shared", "lm_head"]):
+def generate_state_dict(model, state_dict, coef, device, removing_keys = ["shared", "lm_head", "wte", "wpe", "ln", "layer_norm", "embed_tokens", "norm"]):
     # reshape coef
     new_state_dict = {}; cur_len = 0
     for key, param in model.named_parameters():
-        if not param.requires_grad: continue
-        param_len = param.numel()
+        if not param.requires_grad: 
+            continue
         if any([rkey in key for rkey in removing_keys]):
-            new_state_dict[key] = state_dict[key].clone()
+            continue
         else:
-            new_state_dict[key] = state_dict[key].clone() + \
+            param_len = param.numel()
+            new_state_dict[key] = state_dict[key].clone().to(device) + \
                 torch.FloatTensor(coef[cur_len:cur_len+param_len].reshape(param.shape)).to(device)
-        cur_len += param_len
+            cur_len += param_len
     return new_state_dict
 
-def compute_norm(state_dict):
+def compute_norm(state_dict, use_lora = False, remove_keys = ["shared", "lm_head", "wte", "wpe", "ln", "layer_norm", "embed_tokens", "norm"]):
     norm = 0
     for key, val in state_dict.items():
-        if "lora" in key:
+        if use_lora:
+            if "lora" in key:
+                norm += val.clone().square().sum().item()
+        else:
+            if any([rkey in key for rkey in remove_keys]):
+                continue
             norm += val.clone().square().sum().item()
     return np.math.sqrt(norm)
 
@@ -138,9 +144,14 @@ def evaluate_subset(args, lm, tokenizer, data_loader, data_idxes, state_dict, de
     for idx in data_idxes:
         gradient_file_idx = idx // 8
         gradient_file = f"{gradient_dir}/train_batch_{gradient_file_idx}_gradients.npy"
+        if not os.path.exists(gradient_file):
+            print("File not found", gradient_file)
+            continue
         tmp_gradients = np.load(gradient_file)
         gradients.append(tmp_gradients[idx % 8])
     gradients = np.array(gradients)
+    if len(gradients) == 0:
+        return None
     
     # randomly assign labels as 0 or 1
     labels = np.random.binomial(n=1, p=0.7, size=gradients.shape[0])
@@ -159,6 +170,8 @@ def evaluate_subset(args, lm, tokenizer, data_loader, data_idxes, state_dict, de
     clf.fit(train_gradients, train_labels)
     print(clf.score(test_gradients, test_labels))
 
+    ## %%
+    # projection_matrix = np.load(f"./gradients/{args.dataset_key}_{args.model_key}_{args.preset_key}_{args.project_dim}/projection_matrix_{args.run}.npy")
     proj_coef = clf.coef_.copy().flatten().reshape(-1, 1)
     coef = projection_matrix @ proj_coef.flatten()
     print("L2 norm", np.linalg.norm(coef))
@@ -184,20 +197,8 @@ def evaluate_subset(args, lm, tokenizer, data_loader, data_idxes, state_dict, de
     return summary
     
 
-def main(args):
-    args.enable_checkpointing = not args.disable_checkpointing
-    print("arguments".upper().center(80, "-"))
-    print(args)
-    print("-" * 80)
-
-    if args.precision == 16:
-        args.precision = "bf16"
-        print("Setting precision to bf16")
-
-    dataset_key = args.dataset_key
+def initialize_model(args):
     model_key = args.model_key
-    train_key = args.train_key
-
     if "flan" in model_key:
         hf_key = "google/{}".format(model_key.replace("_", "-"))
         model = AutoModelForSeq2SeqLM.from_pretrained(hf_key)
@@ -210,28 +211,77 @@ def main(args):
         tokenizer = T5TokenizerFast.from_pretrained(hf_key, model_max_length=512)
         model_type = "encoder_decoder"
         append_eos = False
-    elif "gpt2" in model_key:
-        from transformers import GPT2Tokenizer, GPT2LMHeadModel
-
-        hf_key = model_key.replace("_", "-")
-        tokenizer = GPT2Tokenizer.from_pretrained(hf_key)
-        model = GPT2LMHeadModel.from_pretrained(hf_key)
+    elif "gpt" in model_key or "Llama" in model_key \
+        or "bloomz" in model_key or "gemma" in model_key or "Mistral" in model_key:
+        hf_key = args.model_key.replace("_", "-")
+        tokenizer = AutoTokenizer.from_pretrained(hf_key)
+        if args.use_qlora:
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type='nf4'
+                )
+            model = AutoModelForCausalLM.from_pretrained(hf_key, quantization_config=quantization_config, torch_dtype=torch.bfloat16, device_map={"": args.devices[0]}) #
+        else:
+            model = AutoModelForCausalLM.from_pretrained(hf_key)
         model_type = "decoder"
         append_eos = True
     else:
         raise NotImplementedError(model_key)
-
+    
     if args.train_lora:
-        config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            target_modules=["q", "k", "v"],
-            lora_dropout=0.1,
-            bias="lora_only",
-            modules_to_save=[],
-        )
+        if args.model_key == "gpt2": # for gpt2, we generally use full model
+            config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=["c_attn", "c_proj", "c_fc"],
+                lora_dropout=0.1,
+                bias="lora_only",
+                modules_to_save=[],
+            )
+        elif args.model_key == "EleutherAI/gpt-neox-20b":
+            config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=["query_key_value"],
+                lora_dropout=0.1,
+                bias="lora_only",
+                modules_to_save=[],
+            )
+        elif "flan" in args.model_key:
+            config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=["q", "k", "v"],
+                lora_dropout=0.1,
+                bias="lora_only",
+                modules_to_save=[],
+            )
+        else:
+            config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=["q_proj", "k_proj", "v_proj"],
+                lora_dropout=0.1,
+                bias="lora_only",
+                modules_to_save=[],
+            )
         model = get_peft_model(model, config)
         model.print_trainable_parameters()
+    return model, tokenizer, hf_key, model_type, append_eos
+
+def main(args):
+    args.enable_checkpointing = not args.disable_checkpointing
+    print("arguments".upper().center(80, "-"))
+    print(args)
+    print("-" * 80)
+
+    dataset_key = args.dataset_key
+    model_key = args.model_key
+    train_key = args.train_key
+
+    model, tokenizer, hf_key, model_type, append_eos = initialize_model(args)
 
     if "ft_cot" in args.preset_key:
         completion_key = "ft_cot"
@@ -270,9 +320,15 @@ def main(args):
     lm = Model(model, tokenizer, model_type, completion_metadata=cm, truncate_early=False)
     load_model_dir = args.load_model_dir
 
-    if load_model_dir is not None:
-        load_model_dir = os.path.join("external_lightning_logs", load_model_dir)
-        lm = lm.load_from_checkpoint(load_model_dir + ".ckpt", model=model, tokenizer=tokenizer, model_type=model_type)
+    # if load_model_dir is not None:
+    #     load_model_dir = os.path.join("external_lightning_logs", load_model_dir)
+    #     lm = Model.load_from_checkpoint(load_model_dir + ".ckpt", model=model, tokenizer=tokenizer, model_type=model_type, completion_metadata=cm, truncate_early=False)
+    if args.load_model_dir is not None:
+        load_model_dir = f"./exported_model/{args.load_model_dir}.pt"
+        if os.path.exists(load_model_dir):
+            state_dict = torch.load(load_model_dir, map_location=lm.model.device)
+            model.load_state_dict(state_dict, strict=False)
+            print("Loaded model from checkpoint from ", load_model_dir)
 
     device = torch.device(f"cuda:{args.devices[0]}")
     lm.completion_metadata = cm
@@ -281,25 +337,30 @@ def main(args):
     save_name = f"{args.dataset_key}_{args.model_key}_{args.preset_key}_run_{args.run}_scale_{args.scale}_project_{args.project_dim}" + \
                 "_subset_size_{}".format(args.subset_size) + \
                 "_clusters_{}".format(args.num_clusters) if args.load_clusters else "" 
-    file_dir = os.path.join("./results/", save_name)
+    file_dir = os.path.join("./results/", save_name).replace("/", "_")
     if not os.path.exists(file_dir):
         os.mkdir(file_dir)
 
     state_dict = {key: val.clone() for key, val in lm.model.state_dict().items()}
-    pretrain_norm = compute_norm(state_dict)
+    pretrain_norm = compute_norm(state_dict, use_lora=args.train_lora)
     print("Norm of the original model", pretrain_norm)
     scale = pretrain_norm * args.scale
 
     gradient_dim = 0
+    remove_keys = ["shared", "lm_head", "wte", "wpe", "ln", "layer_norm", "embed_tokens", "norm"]
     for name, param in model.named_parameters():
         if param.requires_grad:
+            if any([rkey in name for rkey in remove_keys]):
+                continue
             gradient_dim += param.numel()
+    print("Gradient dimension: ", gradient_dim)
 
     np.random.seed(args.run)
     project_dim = args.project_dim
     project_matrix = (2 * np.random.randint(2, size=(gradient_dim, project_dim)) - 1).astype(float)
     project_matrix *= 1 / np.sqrt(project_dim)
 
+    start = time.time()
     if args.load_sample_task_dir is not None:
         sampled_task_dir = os.path.join("./sampled_indices", "{}.txt".format(args.load_sample_task_dir))
 
@@ -321,7 +382,9 @@ def main(args):
                     subset_idxes.sort()
 
                 summary = evaluate_subset(args, lm, tokenizer, test_loader, data_idxes, state_dict, device, project_matrix, scale)
-                
+                if summary is None:
+                    continue
+
                 # save indexes 
                 result_datapoint = {
                     "Data indices": " ".join([str(idx) for idx in subset_idxes])
@@ -357,7 +420,9 @@ def main(args):
                 subset_idxes.sort()
 
             summary = evaluate_subset(args, lm, tokenizer, test_loader, data_idxes, state_dict, device, project_matrix, scale)
-
+            if summary is None:
+                    continue
+            
             # save indexes 
             result_datapoint = {
                 "Data indices": " ".join([str(idx) for idx in subset_idxes])
@@ -369,6 +434,10 @@ def main(args):
 
             with open(sampled_task_dir, "a") as f:
                 f.write(" ".join([str(idx) for idx in subset_idxes]) + "\n")
+        end = time.time()
+        print("Time taken", end-start)
+
+        # Time taken 71.87238311767578
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -388,6 +457,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_lora", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=4)
     parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--use_qlora", action="store_true")
 
     parser.add_argument("--load_model_dir", type=str, default="flan_t5_base_multiarith_ft_cot_lora_r_4/lightning_logs/version_0/checkpoints/epoch=19-step=51400")
     parser.add_argument("--project_dim", type=int, default=200)
@@ -399,7 +469,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--load_clusters", action="store_true")
     parser.add_argument("--num_clusters", type=int, default=200)
-    parser.add_argument("--scale", type=float, default=0.4)
+    parser.add_argument("--scale", type=float, default=0.05)
     
     args = parser.parse_args()
     main(args)

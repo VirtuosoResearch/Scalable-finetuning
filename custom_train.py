@@ -1,3 +1,10 @@
+"""
+Run custom fine-tuning based experiments, i.e., fine-tuning models such as T5, and GPT-2 on GPUs.
+
+Note, to check distributed errors used `TORCH_DISTRIBUTED_DEBUG=DETAIL`
+Note, if deepspeed hangs at initialization, use `NCCL_P2P_DISABLE=1`. Thought, this seems to slow down the training a lot...
+Note, to see more NCCL errors, use NCCL_DEBUG=WARN
+"""
 import argparse
 import logging
 import os
@@ -11,7 +18,7 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 from transformers import T5TokenizerFast, T5ForConditionalGeneration
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 from src.custom.model import Model
 from peft import get_peft_model, LoraConfig
@@ -23,9 +30,16 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO)
 
 torch.set_float32_matmul_precision("high")
+import time
 
 def evaluate(outputs, model, tokenizer):
+    """
+    Gather outputs from all GPUs and save validation predictions as a CompletionDataset and
+    log validation metrics.
 
+    Note, `all_gather` *concatenates* tensors from all GPUs along the first dimension.
+    """
+    # Determine total sample count and local max input/output length
     local_max_output_length = 0
     local_max_input_length = 0
     total_samples = 0
@@ -36,13 +50,14 @@ def evaluate(outputs, model, tokenizer):
 
     max_input_length = local_max_input_length
     max_output_length = local_max_output_length
-
+    # Create local padded tensors
     local_outputs: dict = {
         "sample_index": torch.ones((total_samples,), dtype=torch.long) * tokenizer.pad_token_id,
         "input": torch.ones((total_samples, max_input_length), dtype=torch.long) * tokenizer.pad_token_id,
         "output": torch.ones((total_samples, max_output_length), dtype=torch.long) * tokenizer.pad_token_id,
     }
 
+    # Populate local tensors
     start_index = 0
     for i, batch in enumerate(outputs):
         batch_size = batch["sample_index"].shape[0]
@@ -76,6 +91,7 @@ def evaluate(outputs, model, tokenizer):
         }
 
         assert model.completion_metadata is not None
+        # Save outputs as CompletionDataset
         cd = model._generate_completion_dataset(model.completion_metadata, final_output)
         cd.save()
 
@@ -97,6 +113,80 @@ def add_result_to_csv(result_datapoint, file_name):
         result_df = pd.DataFrame(result_datapoint)  
         result_df.to_csv(file_name)   
 
+def initialize_model(args):
+    model_key = args.model_key
+    if "flan" in model_key:
+        hf_key = "google/{}".format(model_key.replace("_", "-"))
+        model = AutoModelForSeq2SeqLM.from_pretrained(hf_key)
+        tokenizer = AutoTokenizer.from_pretrained(hf_key, model_max_length=512)
+        model_type = "encoder_decoder"
+        append_eos = False  # t5 tokenizers already append eos
+    elif "t5" in model_key:
+        hf_key = model_key.replace("_", "-")
+        model = T5ForConditionalGeneration.from_pretrained(hf_key)
+        tokenizer = T5TokenizerFast.from_pretrained(hf_key, model_max_length=512)
+        model_type = "encoder_decoder"
+        append_eos = False
+    elif "gpt" in model_key or "Llama" in model_key \
+        or "bloomz" in model_key or "gemma" in model_key or "Mistral" in model_key:
+        hf_key = args.model_key.replace("_", "-")
+        tokenizer = AutoTokenizer.from_pretrained(hf_key)
+        if args.use_qlora:
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type='nf4'
+                )
+            model = AutoModelForCausalLM.from_pretrained(hf_key, quantization_config=quantization_config, torch_dtype=torch.bfloat16, device_map={"": args.devices[0]}) #
+        else:
+            model = AutoModelForCausalLM.from_pretrained(hf_key)
+        model_type = "decoder"
+        append_eos = True
+    else:
+        raise NotImplementedError(model_key)
+    
+    if args.train_lora:
+        if args.model_key == "gpt2": # for gpt2, we generally use full model
+            config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=["c_attn", "c_proj", "c_fc"],
+                lora_dropout=0.1,
+                bias="lora_only",
+                modules_to_save=[],
+            )
+        elif args.model_key == "EleutherAI/gpt-neox-20b":
+            config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=["query_key_value"],
+                lora_dropout=0.1,
+                bias="lora_only",
+                modules_to_save=[],
+            )
+        elif "flan" in args.model_key:
+            config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=["q", "k", "v"],
+                lora_dropout=0.1,
+                bias="lora_only",
+                modules_to_save=[],
+            )
+        else:
+            config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=["q_proj", "k_proj", "v_proj"],
+                lora_dropout=0.1,
+                bias="lora_only",
+                modules_to_save=[],
+            )
+        model = get_peft_model(model, config)
+        model.print_trainable_parameters()
+    return model, tokenizer, hf_key, model_type, append_eos
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_key", type=str, default="multiarith")
@@ -107,12 +197,15 @@ if __name__ == "__main__":
     parser.add_argument("--inference_batch_size", type=int, default=None)
     parser.add_argument("--devices", type=int, nargs="+", default=[0, 1])
     parser.add_argument("--accumulate", type=int, default=1)
-    parser.add_argument("--strategy", type=str, default=None)
-    parser.add_argument("--precision", type=int, default=32)
+    parser.add_argument("--strategy", type=str, default="auto")
+    parser.add_argument("--precision", type=str, default="32")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--disable_checkpointing", action="store_true")
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--save_every_epoch", action="store_true")
+    parser.add_argument("--use_qlora", action="store_true")
+    parser.add_argument("--optimizer", type=str, default="adamw")
 
     parser.add_argument("--train_lora", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=4)
@@ -125,6 +218,17 @@ if __name__ == "__main__":
 
     parser.add_argument("--load_model_dir", type=str, default="test")
 
+    parser.add_argument('--train_sam', action="store_true")
+    parser.add_argument('--sam_rho', type=float, default=0.05)
+    parser.add_argument('--sam_adaptive', action="store_true")
+    parser.add_argument('--sam_unnormalize', action="store_true")
+
+    parser.add_argument('--train_nsm', action="store_true")
+    parser.add_argument('--nsm_use_neg', action="store_true")
+    parser.add_argument('--nsm_sigma', type=float, default=0.01)
+    parser.add_argument('--nsm_num_perturbs', type=int, default=1)
+    parser.add_argument('--nsm_lam', type=float, default=0.5)
+
     # for writing results
     parser.add_argument("--write_results", action="store_true")
     parser.add_argument("--subset_idxes", type=int, nargs="+", default=None)
@@ -134,15 +238,13 @@ if __name__ == "__main__":
     print(args)
     print("-" * 80)
 
-    if args.precision == 16:
-        args.precision = "bf16"
-        print("Setting precision to bf16")
+    time_start = time.time()
 
     dataset_key = args.dataset_key
     model_key = args.model_key
     train_key = args.train_key
 
-    model_name = args.model_key.replace("/", "_")
+    model_name = args.model_key.replace("/", "_").replace(".._", "")
     save_name = f"{args.dataset_key}_{model_name}_{args.preset_key}" + \
                 (f"_lora_r_{args.lora_rank}" if args.train_lora else "") + \
                 (f"_{args.save_name}" if args.save_name else "")
@@ -152,60 +254,7 @@ if __name__ == "__main__":
 
     metrics = {}
     for run in range(args.runs):
-        if "flan" in model_key:
-            hf_key = "google/{}".format(model_key.replace("_", "-"))
-            model = AutoModelForSeq2SeqLM.from_pretrained(hf_key)
-            tokenizer = AutoTokenizer.from_pretrained(hf_key, model_max_length=512)
-            model_type = "encoder_decoder"
-            append_eos = False 
-        elif "t5" in model_key:
-            hf_key = model_key.replace("_", "-")
-            model = T5ForConditionalGeneration.from_pretrained(hf_key)
-            tokenizer = T5TokenizerFast.from_pretrained(hf_key, model_max_length=512)
-            model_type = "encoder_decoder"
-            append_eos = False
-        elif "gpt2" in model_key:
-            from transformers import GPT2Tokenizer, GPT2LMHeadModel
-
-            hf_key = model_key.replace("_", "-")
-            tokenizer = GPT2Tokenizer.from_pretrained(hf_key)
-            model = GPT2LMHeadModel.from_pretrained(hf_key)
-            model_type = "decoder"
-            append_eos = True
-        elif "Llama" in model_key:
-            from transformers import AutoTokenizer, AutoModelForCausalLM
-
-            hf_key = model_key
-            tokenizer = AutoTokenizer.from_pretrained(hf_key)
-            model = AutoModelForCausalLM.from_pretrained(hf_key)
-            model_type = "decoder"
-            append_eos = True
-        else:
-            raise NotImplementedError(model_key)
-        
-        if args.train_lora:
-            if "gpt" in model_key or "Llama" in model_key:
-                config = LoraConfig(
-                    r=args.lora_rank,
-                    lora_alpha=args.lora_alpha,
-                    target_modules=["q_proj", "k_proj", "v_proj"],
-                    lora_dropout=0.1,
-                    bias="lora_only",
-                    modules_to_save=[],
-                )
-                model = get_peft_model(model, config)
-                model.print_trainable_parameters()
-            else:
-                config = LoraConfig(
-                    r=args.lora_rank,
-                    lora_alpha=args.lora_alpha,
-                    target_modules=["q", "k", "v"],
-                    lora_dropout=0.1,
-                    bias="lora_only",
-                    modules_to_save=[],
-                )
-                model = get_peft_model(model, config)
-                model.print_trainable_parameters()
+        model, tokenizer, hf_key, model_type, append_eos = initialize_model(args)
         
         if args.feature_transfer:
             for name, param in model.named_parameters():
@@ -240,7 +289,10 @@ if __name__ == "__main__":
                                 data_module.prediction_template, train_key=args.train_key,
                                 train_lora=args.train_lora, lora_rank=args.lora_rank)
         use_cpu_offload = args.strategy and "offload" in args.strategy
-        lm = Model(model, tokenizer, model_type, use_cpu_offload=use_cpu_offload, completion_metadata=cm, lr=args.lr, weight_decay=args.weight_decay)
+        lm = Model(model, tokenizer, model_type, use_cpu_offload=use_cpu_offload, completion_metadata=cm, lr=args.lr, weight_decay=args.weight_decay,
+                    train_sam=args.train_sam, sam_rho=args.sam_rho, sam_adaptive=args.sam_adaptive, sam_unnormalize=args.sam_unnormalize,
+                    train_nsm=args.train_nsm, nsm_use_neg=args.nsm_use_neg, nsm_sigma=args.nsm_sigma, nsm_num_perturbs=args.nsm_num_perturbs, nsm_lam=args.nsm_lam,
+                    optimizer=args.optimizer)
         
         load_model_dir = args.load_model_dir
         load_model_dir = os.path.join("external_lightning_logs", load_model_dir)
@@ -256,7 +308,8 @@ if __name__ == "__main__":
                                             (f"_lora_r_{args.lora_rank}" if args.train_lora else "") + \
                                             (f"_feature_transfer" if args.feature_transfer else "") + \
                                             (f"_{args.save_name}" if args.save_name else "") + \
-                                            f"_run_{run}"
+                                            (f"_sam_rho_{args.sam_rho}" if args.train_sam else "") + \
+                                            (f"_nsm_sigma_{args.nsm_sigma}" if args.train_nsm else "") 
                                         )
         # remove previous checkpoints
         if args.save_name and os.path.exists(default_root_dir):
@@ -266,26 +319,62 @@ if __name__ == "__main__":
             monitor="accuracy",
             dirpath=default_root_dir,
             filename="epoch_{epoch}",
-            save_top_k=1,
+            # every_n_epochs=1,
+            save_top_k=(-1 if args.save_every_epoch else 1),
             mode="max",
         )
-        trainer = pl.Trainer(accelerator="gpu", devices=args.devices, strategy=args.strategy,
-                            default_root_dir=default_root_dir, min_epochs=args.epochs, max_epochs=args.epochs,
-                            accumulate_grad_batches=args.accumulate, precision=args.precision,
-                            enable_checkpointing=args.enable_checkpointing,
-                            callbacks=[checkpoint_callback]
-                            )
+        if args.use_qlora:
+            from lightning.pytorch.plugins import BitsandbytesPrecision
+            # this will pick out the compute dtype automatically, by default `bfloat16`
+            quant_precision = BitsandbytesPrecision(mode="nf4-dq")
+            trainer = pl.Trainer(accelerator="gpu", devices=args.devices, strategy=args.strategy,
+                                default_root_dir=default_root_dir, min_epochs=args.epochs, max_epochs=args.epochs,
+                                accumulate_grad_batches=args.accumulate, # precision=args.precision,
+                                enable_checkpointing=args.enable_checkpointing,
+                                callbacks=[checkpoint_callback], plugins=quant_precision
+                                )
+        else:
+            trainer = pl.Trainer(accelerator="gpu", devices=args.devices, strategy=args.strategy,
+                                default_root_dir=default_root_dir, min_epochs=args.epochs, max_epochs=args.epochs,
+                                accumulate_grad_batches=args.accumulate, precision=args.precision,
+                                enable_checkpointing=args.enable_checkpointing,
+                                callbacks=[checkpoint_callback]
+                                )
 
         trainer.fit(lm, datamodule=data_module)
 
         # evaluate the best checkpoint
         if args.epochs > 0:
-            lm = Model.load_from_checkpoint(checkpoint_callback.best_model_path, 
-                                        model=model, tokenizer=tokenizer, 
-                                        model_type=model_type, completion_metadata=cm)
-
-        summary = trainer.validate(lm, datamodule=data_module)[0]
-        logging.info(summary)
+            # lm = lm.load_from_checkpoint(checkpoint_callback.best_model_path, 
+            #                             model=model, tokenizer=tokenizer, 
+            #                             model_type=model_type, completion_metadata=cm)
+            # test_loader = data_module.test_dataloader()
+            # outputs = []; lm.model.eval()
+            # for batch_idx, batch in enumerate(test_loader):
+            #     batch = {k: v.to(lm.device) for k, v in batch.items()}
+            #     batch_output = lm.validation_step(batch, batch_idx)
+            #     outputs.append(batch_output)
+            # summary = evaluate(outputs, lm, tokenizer)
+            if args.use_qlora:
+                from lightning_fabric.utilities.cloud_io import _load as pl_load
+                checkpoint = pl_load(checkpoint_callback.best_model_path, map_location=lm.device)
+                state_dict = checkpoint["state_dict"]
+                state_dict = {k: v for k, v in state_dict.items() if "lora" in k}       
+                         
+                model, tokenizer, hf_key, model_type, append_eos = initialize_model(args)
+                model.load_state_dict(state_dict, strict=False)
+                lm = Model(model, tokenizer, model_type, use_cpu_offload=use_cpu_offload, completion_metadata=cm, lr=args.lr, weight_decay=args.weight_decay,
+                    train_sam=args.train_sam, sam_rho=args.sam_rho, sam_adaptive=args.sam_adaptive, sam_unnormalize=args.sam_unnormalize,
+                    train_nsm=args.train_nsm, nsm_use_neg=args.nsm_use_neg, nsm_sigma=args.nsm_sigma, nsm_num_perturbs=args.nsm_num_perturbs, nsm_lam=args.nsm_lam,
+                    optimizer=args.optimizer)
+                
+                summary = trainer.validate(lm, datamodule=data_module)[0]
+            else:
+                summary = trainer.validate(lm, datamodule=data_module,  ckpt_path=checkpoint_callback.best_model_path)[0]
+            logging.info(summary)
+        else:
+            summary = trainer.validate(lm, datamodule=data_module)[0]
+            logging.info(summary)
 
         # save indexes 
         if args.write_results and run == 0:
@@ -305,3 +394,6 @@ if __name__ == "__main__":
     
     for key in metrics:
         logging.info(f"{key}: {np.mean(metrics[key])} +/- {np.std(metrics[key])}")
+
+    time_end = time.time()
+    logging.info(f"Total time: {time_end - time_start}")

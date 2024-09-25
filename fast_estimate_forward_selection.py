@@ -159,6 +159,8 @@ def evaluate_subset(args, lm, tokenizer, data_loader, data_idxes, state_dict, de
     clf.fit(train_gradients, train_labels)
     print(clf.score(test_gradients, test_labels))
 
+    ## %%
+    # projection_matrix = np.load(f"./gradients/{args.dataset_key}_{args.model_key}_{args.preset_key}_{args.project_dim}/projection_matrix_{args.run}.npy")
     proj_coef = clf.coef_.copy().flatten().reshape(-1, 1)
     coef = projection_matrix @ proj_coef.flatten()
     print("L2 norm", np.linalg.norm(coef))

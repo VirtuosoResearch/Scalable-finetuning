@@ -23,6 +23,7 @@ from eval.truthfulqa.utilities import (
 )
 from eval.truthfulqa.metrics import run_gpt_classifier_eval, run_hf_classifier_eval, MC_calcs
 from eval.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
+from peft import get_peft_model, LoraConfig
 
 
 def trim_answer(answer):
@@ -287,7 +288,28 @@ def main(args):
             gptq_model=args.gptq,
         )
         if args.adapter_path:
-            model.load_adapter(args.adapter_path)
+            config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=["q_proj", "k_proj", "v_proj"],
+                lora_dropout=0.1,
+                bias="lora_only",
+                modules_to_save=[],
+            )
+            model = get_peft_model(model, config)
+            model.print_trainable_parameters()
+            if os.path.exists(args.adapter_path + ".pt"):
+                state_dict = torch.load(args.adapter_path + ".pt", map_location=model.device)
+                model.load_state_dict(state_dict, strict=False)
+                print("Loaded LoRA adapter from {}".format(args.adapter_path))
+            else:
+                print("No adapter found at {}".format(args.adapter_path))
+                exit()
+        # print(model.model.layers[0].self_attn.q_proj.lora_A["default"].weight.data)
+        # for name, param in model.named_parameters():
+        #     if "lora_A" in name or "lora_B" in name:
+        #         param.data *= 1000
+        # print(model.model.layers[0].self_attn.q_proj.lora_A["default"].weight.data)
         from transformers import GPTNeoXForCausalLM, OPTForCausalLM
         if isinstance(model, GPTNeoXForCausalLM) or isinstance(model, OPTForCausalLM):
             tokenizer.model_max_length = model.config.max_position_embeddings
@@ -408,6 +430,16 @@ if __name__ == '__main__':
         type=str, 
         default=None, 
         help="If specified, we will load the tokenizer from here."
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=128,
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=512,
     )
     parser.add_argument(
         "--adapter_path",

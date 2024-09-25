@@ -17,7 +17,7 @@ from eval.utils import (
     load_hf_tokenizer,
 )
 from eval.utils import dynamic_import_function 
-
+from peft import get_peft_model, LoraConfig
 
 @torch.no_grad()
 def score_generations(
@@ -101,6 +101,24 @@ def main(args):
                 device_map="balanced_low_0" if torch.cuda.device_count() > 1 else "auto",
                 gptq_model=args.gptq,
             )
+            if args.adapter_path:
+                config = LoraConfig(
+                    r=args.lora_rank,
+                    lora_alpha=args.lora_alpha,
+                    target_modules=["q_proj", "k_proj", "v_proj"],
+                    lora_dropout=0.1,
+                    bias="lora_only",
+                    modules_to_save=[],
+                )
+                model = get_peft_model(model, config)
+                model.print_trainable_parameters()
+                if os.path.exists(args.adapter_path + ".pt"):
+                    state_dict = torch.load(args.adapter_path + ".pt", map_location=model.device)
+                    model.load_state_dict(state_dict, strict=False)
+                    print("Loaded LoRA adapter from {}".format(args.adapter_path))
+                else:
+                    print("No adapter found at {}".format(args.adapter_path))
+                    exit()
             from transformers import GPTNeoXForCausalLM, OPTForCausalLM
             if isinstance(model, GPTNeoXForCausalLM) or isinstance(model, OPTForCausalLM):
                 tokenizer.model_max_length = model.config.max_position_embeddings
@@ -193,6 +211,22 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="if specified, we will load the tokenizer from here.",
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=128,
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=512,
+    )
+    parser.add_argument(
+        "--adapter_path",
+        type=str,
+        default=None,
+        help="If specified, we will load the adapter from here."
     )
     parser.add_argument(
         "--use_slow_tokenizer",

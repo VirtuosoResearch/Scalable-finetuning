@@ -10,6 +10,7 @@ import torch.nn.functional as F
 # from deepspeed.ops.adam import DeepSpeedCPUAdam
 from transformers import PreTrainedTokenizerBase
 import numpy as np
+from utils.sam import SAM
 import os
 
 class AlpacaModel(pl.LightningModule):
@@ -17,7 +18,8 @@ class AlpacaModel(pl.LightningModule):
 
     def __init__(self, model, tokenizer: PreTrainedTokenizerBase, model_type: str, use_cpu_offload=False,
                 lr=3e-4, truncate_early=True, max_length=1024, weight_decay=1e-4, use_wandb=False,
-                intialize_project_matrix=False, run_seed = 0, project_dim = 200, gradient_dir = "test", predict_steps = 2000):
+                intialize_project_matrix=False, run_seed = 0, project_dim = 200, gradient_dir = "test", predict_steps = 2000, use_sgd=True,
+                train_sam = False, sam_rho = 0.05, sam_adaptive = False, sam_unnormalize = False, optimizer="adamw"):
         """
         - completion_metadata: metaddata used to save completions. If None, completions are not saved.
           `epoch_N` is appended to the `train_key` when saving intermediate validation completions.
@@ -34,10 +36,24 @@ class AlpacaModel(pl.LightningModule):
         self.use_wandb = use_wandb
         self.validation_step_outputs = []
         gradient_dim = 0
+        self.use_sgd = use_sgd
+
+        self.train_sam = train_sam
+        self.sam_rho = sam_rho
+        self.sam_adaptive = sam_adaptive
+        self.sam_unnormalize = sam_unnormalize
+        self.optimizer = optimizer
+
+        if self.train_sam:
+            self.automatic_optimization = False
         
+        self.removing_keys = ["shared", "lm_head", "wte", "wpe", "ln", "embed_tokens", "norm", "word_embeddings" ]
         for name, param in model.named_parameters():
+            if any([key in name for key in self.removing_keys]):
+                continue
             if param.requires_grad:
                 gradient_dim += param.numel()
+        print("Creating project matrix with dimensions: ", gradient_dim, project_dim)
         if intialize_project_matrix:
             np.random.seed(run_seed)
             self.project_matrix = (2 * np.random.randint(2, size=(gradient_dim, project_dim)) - 1).astype(float)
@@ -49,7 +65,15 @@ class AlpacaModel(pl.LightningModule):
         self.predict_steps = predict_steps
 
     def get_trainable_parameters(self):
-        return [param for name, param in self.model.named_parameters() if name in self.param_names]
+        return [param for name, param in self.model.named_parameters()\
+                if (name in self.param_names) and (not any([key in name for key in self.removing_keys]))]
+
+    def on_validation_end(self) -> None:
+        if not self.automatic_optimization:
+            # Save a checkpoint of the model
+            ckpt_path = os.path.join(self.trainer.log_dir, 'checkpoints', 'ckpt.pt')
+            self.trainer.save_checkpoint(ckpt_path)
+        return super().on_validation_end()
 
     def training_step(self, batch, batch_idx):
         kwargs = {
@@ -59,10 +83,27 @@ class AlpacaModel(pl.LightningModule):
         }
         if self.model_type == "encoder_decoder":
             kwargs["decoder_attention_mask"] = batch["decoder_attention_mask"]
-        loss = self.model(**kwargs)["loss"]
-        if self.use_wandb:
-            wandb.log({"train_loss": loss})
-        return loss
+        if self.train_sam:
+            optimizer = self.optimizers()
+            # `optimizer` is a `LightningOptimizer` wrapping the optimizer.
+            # To access it, do the following.
+            # However, it won't work on TPU, AMP, etc...
+            sam_optimizer = optimizer.optimizer
+
+            # first forward-backward pass
+            loss_1 = self.model(**kwargs)["loss"]
+            self.manual_backward(loss_1)
+            sam_optimizer.first_step(zero_grad=True)
+
+            # second forward-backward pass
+            loss_2 = self.model(**kwargs)["loss"]
+            self.manual_backward(loss_2)
+            sam_optimizer.second_step(zero_grad=True)
+        else:
+            loss = self.model(**kwargs)["loss"]
+            if self.use_wandb:
+                wandb.log({"train_loss": loss})
+            return loss
 
     def validation_step(self, batch, batch_idx) -> Dict[str, torch.Tensor]:
         """
@@ -73,12 +114,17 @@ class AlpacaModel(pl.LightningModule):
 
         outputs = self.model(input_ids, labels=labels)
         lm_logits = outputs.logits 
-        assert self.model_type == "decoder"
-        shift_logits = lm_logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
+        if self.model_type == "decoder":
+            shift_logits = lm_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            context_length = self.max_length - 1
+        else:
+            shift_logits = lm_logits[..., :, :].contiguous()
+            shift_labels = labels[..., :].contiguous()
+            context_length = 64
         losses = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="none")
 
-        context_length = self.max_length - 1
+        
         losses = losses.view(-1, context_length)
         keep = losses != 0
         losses = (losses).sum(dim = 1) / keep.sum(dim = 1)
@@ -135,17 +181,24 @@ class AlpacaModel(pl.LightningModule):
     def predict_step(self, batch, batch_idx):
         # collect the gradients and project them to the embedding space
         torch.set_grad_enabled(True)
+
         kwargs = {
             "input_ids": batch["input_ids"],
             "attention_mask": batch["attention_mask"],
             "labels": batch["labels"],
         }
+        if self.model_type == "encoder_decoder":
+            kwargs["decoder_attention_mask"] = batch["decoder_attention_mask"]
         model_outputs = self.model(**kwargs)
         logits = model_outputs.logits
         
         labels = kwargs["labels"]
-        logits = logits[..., :-1, :].contiguous()
-        labels = labels[..., 1:].contiguous()
+        if self.model_type == "decoder":
+            logits = logits[..., :-1, :].contiguous()
+            labels = labels[..., 1:].contiguous()
+        else:
+            logits = logits[..., :, :].contiguous()
+            labels = labels[..., :].contiguous()
         gradients = []; outputs = np.zeros(labels.shape)
 
         if self.predict_steps < batch_idx:
@@ -159,15 +212,16 @@ class AlpacaModel(pl.LightningModule):
             tmp_labels = labels[i][tmp_mask]
 
             tmp_outputs = tmp_probs[range(tmp_probs.size(0)), tmp_labels]
-            tmp_outputs[tmp_outputs>0.9] -= 1e-3 # in case tmp_outputs is less than zero            
+            tmp_outputs[tmp_outputs>0.9] -= 1e-2 # in case (1-tmp_outputs) is less than zero
+            tmp_outputs[tmp_outputs<0.001] += 1e-2            
             tmp_outputs = torch.log(tmp_outputs/(1-tmp_outputs))
             tmp_loss = tmp_outputs.mean()
 
             tmp_gradients = torch.autograd.grad(tmp_loss, self.get_trainable_parameters(), retain_graph=True, create_graph=False)
-            tmp_gradients = torch.cat([gradient.reshape(-1) for gradient in tmp_gradients]).cpu().numpy() # flatten gradients
+            tmp_gradients = torch.cat([gradient.reshape(-1) for gradient in tmp_gradients]).cpu().type(torch.float32).numpy() # flatten gradients
             tmp_gradients = (tmp_gradients.reshape(1, -1) @ self.project_matrix).flatten()
             gradients.append(tmp_gradients)
-            outputs[i, :tmp_outputs.size(0)] = tmp_outputs.clone().detach().cpu().numpy()
+            outputs[i, :tmp_outputs.size(0)] = tmp_outputs.clone().detach().cpu().type(torch.float32).numpy()
         gradients = np.array(gradients); logits.detach()
         np.save(f"{self.gradient_dir}/train_batch_{batch_idx}_gradients.npy", gradients)
         return outputs
@@ -175,6 +229,29 @@ class AlpacaModel(pl.LightningModule):
     def configure_optimizers(self):
         if self.use_cpu_offload:
             optimizer = DeepSpeedCPUAdam(self.parameters(), lr=self.lr)
+        elif self.train_sam:
+            base_optimizer = torch.optim.AdamW
+            optimizer = SAM(self.parameters(), base_optimizer, rho=self.sam_rho, adaptive=self.sam_adaptive, unnormalize=self.sam_unnormalize, lr=self.lr, weight_decay=self.weight_decay)
+        elif self.use_sgd:
+            optimizer = torch.optim.SGD(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         else:
-            optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            if self.optimizer == "adamw":
+                optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            else:
+                import bitsandbytes as bnb
+                optimizer_dict = {
+                    "adamw_8bit": bnb.optim.AdamW8bit,
+                    "paged_adamw_8bit": bnb.optim.PagedAdamW8bit,
+                    "paged_adamw_32bit": bnb.optim.PagedAdamW32bit,
+                }
+
+                optimizer = optimizer_dict[self.optimizer](self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+                # force embedding layers to use 32 bit for numerical stability
+                # https://github.com/huggingface/transformers/issues/14819#issuecomment-1003445038
+                for module in self.model.modules():
+                    if isinstance(module, torch.nn.Embedding):
+                        bnb.optim.GlobalOptimManager.get_instance().register_module_override(
+                            module, "weight", {"optim_bits": 32}
+                        )
         return optimizer

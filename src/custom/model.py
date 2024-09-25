@@ -17,13 +17,17 @@ from data.completion_dataset import CompletionDataset, CompletionMetadata
 from data.dataset import Dataset
 from evaluation.evaluator import Evaluator
 from evaluation.summary import summarize_evaluation
-
+from utils.sam import SAM
+from utils.nsm import NSM
+import os
 
 class Model(pl.LightningModule):
     validation_predictions: Dict
 
     def __init__(self, model, tokenizer: PreTrainedTokenizerBase, model_type: str, use_cpu_offload=False,
-                 completion_metadata: CompletionMetadata = None, lr=3e-4, truncate_early=True, max_length=1024, weight_decay=1e-4):
+                 completion_metadata: CompletionMetadata = None, lr=3e-4, truncate_early=True, max_length=1024, weight_decay=1e-4,
+                 train_sam = False, sam_rho = 0.05, sam_adaptive = False, sam_unnormalize = False,
+                 train_nsm=False, nsm_use_neg=False, nsm_sigma=0.01, nsm_num_perturbs=1, nsm_lam = 0, optimizer="adamw"):
         """
         - completion_metadata: metaddata used to save completions. If None, completions are not saved.
           `epoch_N` is appended to the `train_key` when saving intermediate validation completions.
@@ -39,6 +43,27 @@ class Model(pl.LightningModule):
         self.truncate_early = truncate_early
         self.weight_decay = weight_decay
         self.validation_step_outputs = []
+        self.train_sam = train_sam
+        self.sam_rho = sam_rho
+        self.sam_adaptive = sam_adaptive
+        self.sam_unnormalize = sam_unnormalize
+
+        self.train_nsm = train_nsm
+        self.nsm_use_neg = nsm_use_neg
+        self.nsm_sigma = nsm_sigma
+        self.nsm_num_perturbs = nsm_num_perturbs
+        self.nsm_lam = nsm_lam
+        self.optimizer = optimizer
+
+        if self.train_sam or self.train_nsm:
+            self.automatic_optimization = False
+
+    def on_validation_end(self) -> None:
+        if not self.automatic_optimization:
+            # Save a checkpoint of the model
+            ckpt_path = os.path.join(self.trainer.log_dir, 'checkpoints', 'ckpt.pt')
+            self.trainer.save_checkpoint(ckpt_path)
+        return super().on_validation_end()
 
     def training_step(self, batch, batch_idx):
         kwargs = {
@@ -48,7 +73,49 @@ class Model(pl.LightningModule):
         }
         if self.model_type == "encoder_decoder":
             kwargs["decoder_attention_mask"] = batch["decoder_attention_mask"]
-        return self.model(**kwargs)["loss"]
+        if self.train_sam:
+            optimizer = self.optimizers()
+            # `optimizer` is a `LightningOptimizer` wrapping the optimizer.
+            # To access it, do the following.
+            # However, it won't work on TPU, AMP, etc...
+            sam_optimizer = optimizer.optimizer
+
+            # first forward-backward pass
+            loss_1 = self.model(**kwargs)["loss"]
+            self.manual_backward(loss_1)
+            sam_optimizer.first_step(zero_grad=True)
+
+            # second forward-backward pass
+            loss_2 = self.model(**kwargs)["loss"]
+            self.manual_backward(loss_2)
+            sam_optimizer.second_step(zero_grad=True)
+        elif self.train_nsm:
+            optimizer = self.optimizers()
+            # `optimizer` is a `LightningOptimizer` wrapping the optimizer.
+            # To access it, do the following.
+            # However, it won't work on TPU, AMP, etc...
+            nsm_optimizer = optimizer.optimizer
+
+            loss = self.model(**kwargs)["loss"]
+            self.manual_backward(loss)
+            nsm_optimizer.store_gradients(zero_grad=True, store_weights=True, update_weight=self.nsm_lam)
+
+            # second forward-backward step
+            if self.nsm_num_perturbs != 0:
+                update_weight = (1-self.nsm_lam)/(2*self.nsm_num_perturbs) if self.nsm_use_neg else (1-self.nsm_lam)/(self.nsm_num_perturbs)
+                for i in range(self.nsm_num_perturbs):
+                    nsm_optimizer.first_step(zero_grad=True, store_perturb=True)
+                    loss = self.model(**kwargs)["loss"]
+                    self.manual_backward(loss)
+                    nsm_optimizer.store_gradients(zero_grad=True, store_weights=False, update_weight=update_weight)
+                    if self.nsm_use_neg:
+                        nsm_optimizer.first_step(zero_grad=True, store_perturb=False)
+                        loss = self.model(**kwargs)["loss"]
+                        self.manual_backward(loss)
+                        nsm_optimizer.store_gradients(zero_grad=True, store_weights=False, update_weight=update_weight)
+            nsm_optimizer.second_step(zero_grad=True)
+        else:
+            return self.model(**kwargs)["loss"]
 
     def validation_step(self, batch, batch_idx) -> Dict[str, torch.Tensor]:
         """
@@ -166,8 +233,32 @@ class Model(pl.LightningModule):
     def configure_optimizers(self):
         if self.use_cpu_offload:
             optimizer = DeepSpeedCPUAdam(self.parameters(), lr=self.lr)
+        elif self.train_sam:
+            base_optimizer = torch.optim.AdamW
+            optimizer = SAM(self.parameters(), base_optimizer, rho=self.sam_rho, adaptive=self.sam_adaptive, unnormalize=self.sam_unnormalize, lr=self.lr, weight_decay=self.weight_decay)
+        elif self.train_nsm:
+            base_optimizer = torch.optim.AdamW
+            optimizer = NSM(self.parameters(), base_optimizer, sigma=self.nsm_sigma, distribution="normal", lr=self.lr, weight_decay=self.weight_decay)
         else:
-            optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            if self.optimizer == "adamw":
+                optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            else:
+                import bitsandbytes as bnb
+                optimizer_dict = {
+                    "adamw_8bit": bnb.optim.AdamW8bit,
+                    "paged_adamw_8bit": bnb.optim.PagedAdamW8bit,
+                    "paged_adamw_32bit": bnb.optim.PagedAdamW32bit,
+                }
+
+                optimizer = optimizer_dict[self.optimizer](self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+                # force embedding layers to use 32 bit for numerical stability
+                # https://github.com/huggingface/transformers/issues/14819#issuecomment-1003445038
+                for module in self.model.modules():
+                    if isinstance(module, torch.nn.Embedding):
+                        bnb.optim.GlobalOptimManager.get_instance().register_module_override(
+                            module, "weight", {"optim_bits": 32}
+                        )
         return optimizer
 
     @staticmethod

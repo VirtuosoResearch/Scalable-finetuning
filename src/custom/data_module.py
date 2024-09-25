@@ -194,6 +194,8 @@ class DataModule(pl.LightningDataModule):
             lengths = torch.tensor(lengths)
             pad_lengths = (lengths.max() - lengths).tolist()
             for i, l in enumerate(pad_lengths):
+                # Apply left side padding
+                # Why? https://github.com/huggingface/transformers/issues/3021#issuecomment-1231526631
                 input_ids[i] = [self.tokenizer.pad_token_id] * l + input_ids[i]
                 attention_mask[i] = [0] * l + attention_mask[i]
                 label_ids[i] = [-100] * l + label_ids[i]

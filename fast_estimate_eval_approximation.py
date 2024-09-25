@@ -20,13 +20,13 @@ logging.basicConfig(level=logging.INFO)
 torch.set_float32_matmul_precision("high")
 
 class args:
-    dataset_key = "multiarith"
+    dataset_key = "strategy_qa"
     model_key = "flan_t5_base"
     train_key = "ft_cot"
     batch_size = 8
     preset_key = "ft_cot_t70_64aug"
     inference_batch_size = None
-    devices = [1]
+    devices = [2]
     accumulate = 1
     strategy = None
     precision = 32
@@ -34,7 +34,7 @@ class args:
     disable_checkpointing = False
 
     # projections
-    project_dim = 200
+    project_dim = 100
     create_projection = True
     run = 0
 
@@ -42,7 +42,7 @@ class args:
     lora_rank = 4
     lora_alpha = 32
 
-    load_model_dir = "flan_t5_base_multiarith_ft_cot_t70_64aug_lora_r_4_run_0/epoch_epoch=19"
+    load_model_dir = None # "flan_t5_base_multiarith_ft_cot_t70_64aug_lora_r_4_run_0/epoch_epoch=19"
 
 args.enable_checkpointing = not args.disable_checkpointing
 print("arguments".upper().center(80, "-"))
@@ -145,7 +145,7 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 
 def generate_state_dict(model, state_dict, coef, device, removing_keys = ["shared", "lm_head"]):
-
+    # reshape coef
     new_state_dict = {}; cur_len = 0
     for key, param in model.named_parameters():
         if not param.requires_grad: continue
@@ -185,17 +185,20 @@ for run in range(10):
     subset_idxes = np.random.choice(dataset_len, int(0.5*dataset_len), replace=False)
     subset_idxes.sort()
 
-    gradient_dir = f"./gradients/{args.dataset_key}_{args.model_key}_{args.preset_key}_{args.project_dim}/run_{args.run}"
+    gradient_dir = f"./gradients/{args.dataset_key}_{args.model_key}_{args.preset_key}_{args.project_dim}/run_{args.run}" if args.load_model_dir is not None else \
+        f"./gradients/{args.dataset_key}_{args.model_key}_{args.preset_key}_{args.project_dim}_pretrained/run_{args.run}"
     gradients = []
     for idx in subset_idxes:
         gradient_file_idx = idx // args.batch_size
         gradient_file = f"{gradient_dir}/train_batch_{gradient_file_idx}_gradients.npy"
+        if not os.path.exists(gradient_file):
+            continue
         tmp_gradients = np.load(gradient_file)
         gradients.append(tmp_gradients[idx % args.batch_size])
     gradients = np.array(gradients)
-
+    # randomly assign labels as 0 or 1
     labels = np.random.binomial(n=1, p=0.7, size=gradients.shape[0])
-
+    # reverse the gradients for the 0 labels
     mask = np.copy(labels)
     mask[labels == 0] = -1
     mask = mask.reshape(-1, 1)
@@ -212,7 +215,7 @@ for run in range(10):
     coef = project_matrix @ proj_coef.flatten()
     print("L2 norm", np.linalg.norm(coef))
 
-
+    # def eval_output(model, task_idx, train_loader, device, pretrain_state_dict, finetuned_state_dict, steps = 200):
     for scale in np.arange(0.2, 0.0, -0.02):
         cur_coef = (scale *  pretrain_norm) * coef / np.linalg.norm(coef) 
         print("Current norm of the coef", np.linalg.norm(cur_coef))
@@ -233,12 +236,12 @@ for run in range(10):
 
         parameters = [param for param in model.parameters() if param.requires_grad]
 
-
+        # For decoupling trainer, the train loader only loads propagated features and labels
         diffs = 0; counts = 0; sum=0
         for batch in train_loader:
             model.load_state_dict(pretrain_state_dict)
             batch = {k: v.to(lm.device) for k, v in batch.items()}
-
+            # output = lm.training_step(batch, 0)
             
             kwargs = {
                 "input_ids": batch["input_ids"],
