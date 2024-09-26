@@ -97,20 +97,10 @@ def main(args):
             gradients.append(np.load(os.path.join(gradient_dir, file)))
     gradients = np.concatenate(gradients, axis=0)
 
-    # gradient_similarities = np.dot(gradients, gradients.T)
-
-    # Estimate cluster gradients
-    # clustering = SpectralClustering(n_clusters=args.num_clusters, 
-    #                                 affinity="rbf", 
-    #                                 n_init=10).fit(gradient_similarities)
     clustering = AgglomerativeClustering(n_clusters=args.num_clusters, 
                                     metric="cosine",
                                     linkage="average").fit(gradients)
     assignments = clustering.labels_
-    # assignments_dict = run_sdp_clustering(gradient_similarities, args.num_clusters, use_exp=True, temperature=1.0)
-    # assignments = np.zeros(gradients.shape[0])
-    # for cluster_idx in assignments_dict:
-    #     assignments[assignments_dict[cluster_idx]] = cluster_idx
 
     cluster_dir = f"./gradients/{args.dataset_key}_{args.model_key}_{args.preset_key}_{args.project_dim}/clusters_{args.num_clusters}"
 
@@ -123,20 +113,6 @@ def main(args):
         np.save(os.path.join(cluster_dir, f"cluster_{i}.npy"), cur_cluster)
         print(cur_cluster.shape)
 
-    # # %%
-    # def computer_inter_cluster_density(features, assignments):
-    #     n_clusters = len(np.unique(assignments))
-    #     cluster_density = np.zeros(n_clusters)
-    #     for i in range(n_clusters):
-    #         cur_cluster = features[assignments == i]
-    #         # computer pairwise distance
-    #         for j in range(len(cur_cluster)):
-    #             cluster_density[i] += np.linalg.norm(cur_cluster - cur_cluster[j].reshape(1, -1), axis=1).sum()
-    #         cluster_density[i] /= len(cur_cluster)
-    #     return cluster_density
-
-    # density = computer_inter_cluster_density(gradients, assignments)
-    # print(np.mean(density))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
