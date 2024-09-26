@@ -10,3 +10,7 @@ sentencepiece
 deepspeed
 scipy
 seaborn
+cvxpy
+peft
+scikit-learn
+evaluation

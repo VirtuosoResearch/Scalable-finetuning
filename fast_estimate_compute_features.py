@@ -131,8 +131,7 @@ def main(args):
     # Save gradients
     for batch_idx, batch in enumerate(train_loader):
         batch = {k: v.to(lm.device) for k, v in batch.items()}
-        # output = lm.training_step(batch, 0)
-        
+
         kwargs = {
             "input_ids": batch["input_ids"],
             "attention_mask": batch["attention_mask"],

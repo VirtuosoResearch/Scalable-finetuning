@@ -42,7 +42,7 @@ class args:
     lora_rank = 4
     lora_alpha = 32
 
-    load_model_dir = None # "flan_t5_base_multiarith_ft_cot_t70_64aug_lora_r_4_run_0/epoch_epoch=19"
+    load_model_dir = None 
 
 args.enable_checkpointing = not args.disable_checkpointing
 print("arguments".upper().center(80, "-"))
@@ -215,7 +215,6 @@ for run in range(10):
     coef = project_matrix @ proj_coef.flatten()
     print("L2 norm", np.linalg.norm(coef))
 
-    # def eval_output(model, task_idx, train_loader, device, pretrain_state_dict, finetuned_state_dict, steps = 200):
     for scale in np.arange(0.2, 0.0, -0.02):
         cur_coef = (scale *  pretrain_norm) * coef / np.linalg.norm(coef) 
         print("Current norm of the coef", np.linalg.norm(cur_coef))
@@ -241,7 +240,6 @@ for run in range(10):
         for batch in train_loader:
             model.load_state_dict(pretrain_state_dict)
             batch = {k: v.to(lm.device) for k, v in batch.items()}
-            # output = lm.training_step(batch, 0)
             
             kwargs = {
                 "input_ids": batch["input_ids"],

@@ -139,18 +139,7 @@ def main(args):
                 ("_{}".format(args.save_name) if args.save_name != "none" else "")
     gradient_dir = save_name + f"_dim_{args.project_dimension}_run_{args.run}" + ("_pretrained" if args.load_model_dir is None else "")
     print("Gradient directory", gradient_dir)
-    ''' Deprecated '''
-    # if args.load_model_dir is not None:
-    #     load_model_dir = os.path.join("external_lightning_logs", args.load_model_dir)
-    #     if os.path.exists(load_model_dir + ".ckpt"):
-    #         lm = AlpacaModel.load_from_checkpoint(load_model_dir + ".ckpt", model=model, tokenizer=tokenizer, model_type=model_type,
-    #                                 lr=args.lr, weight_decay=args.weight_decay, max_length=args.max_length, use_wandb=args.use_wandb,
-    #                                 intialize_project_matrix=args.project_gradients, run_seed=args.run, 
-    #                                 project_dim=args.project_dimension, gradient_dir=gradient_dir, use_sgd=True,
-    #                                 predict_steps=args.num_batches_gradients)
-    #         print("Loaded model from checkpoint")
-    # else:
-    ''' Deprecated '''
+
     lm = AlpacaModel(model=model, tokenizer=tokenizer, model_type=model_type,
                     lr=args.lr, weight_decay=args.weight_decay, max_length=args.max_length, use_wandb=args.use_wandb,
                     intialize_project_matrix=args.project_gradients, run_seed=args.run, 
@@ -190,7 +179,6 @@ def main(args):
             param_len = param.numel()
             if any([rkey in key for rkey in removing_keys]):
                 continue
-                # new_state_dict[key] = state_dict[key].clone()
             else:
                 new_state_dict[key] = state_dict[key].clone() + \
                     torch.FloatTensor(coef[cur_len:cur_len+param_len].reshape(param.shape)).to(device)
@@ -221,17 +209,6 @@ def main(args):
         print("Pretrained outputs shape", pretrain_outputs.shape)
         np.save(f"./gradients/{gradient_dir}/pretrain_outputs.npy", pretrain_outputs)
     else:
-        # gradient_dim = 0; removing_keys = ["shared", "lm_head", "wte", "wpe", "ln", "layer_norm", "embed_tokens", "norm"]
-        # for name, param in model.named_parameters():
-        #     if any([key in name for key in removing_keys]):
-        #         continue
-        #     if param.requires_grad:
-        #         gradient_dim += param.numel()
-
-        # np.random.seed(args.run)
-        # project_dim = args.project_dimension
-        # project_matrix = (2 * np.random.randint(2, size=(gradient_dim, project_dim)) - 1).astype(float)
-        # project_matrix *= 1 / np.sqrt(project_dim)
         project_matrix = lm.project_matrix
         inv_project_matrix = np.linalg.pinv(project_matrix)
 

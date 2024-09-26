@@ -171,14 +171,7 @@ def main(args):
         file_dir = os.path.join("./results/", save_name)
         if not os.path.exists(file_dir):
             os.mkdir(file_dir)
-        '''Deprecated'''
-        # if os.path.exists(load_model_dir + ".ckpt"):
-        #     gradient_dir = "./gradients/" + save_name
-        #     lm = AlpacaModel.load_from_checkpoint(load_model_dir + ".ckpt", model=model, tokenizer=tokenizer, model_type=model_type,
-        #                             lr=args.lr, weight_decay=args.weight_decay, max_length=args.max_length, use_wandb=args.use_wandb,
-        #                             intialize_project_matrix=args.project_gradients, run_seed=args.run, 
-        #                             project_dim=args.project_dimension, gradients_dir=gradient_dir, use_sgd=True)
-        '''Deprecated'''
+        
         gradient_dir = "./gradients/" + save_name
         lm =  AlpacaModel(model, tokenizer, model_type, 
                         lr=args.lr, weight_decay=args.weight_decay, max_length=args.max_length, use_wandb=args.use_wandb,
