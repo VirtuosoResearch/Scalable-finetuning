@@ -8,7 +8,7 @@
 
 This code provides the implementation to conduct gradient-based (first-order) estimation for fine-tuned language models. The experiments involve intruction fine-tuning and chain-of-thought fine-tuning. 
 
-This project has been accepted by EMNLP 2024 Finding. Paper link is [here]().
+This project has been accepted by EMNLP 2024 Finding.
 
 ### Requirements
 
