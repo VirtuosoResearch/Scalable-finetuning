@@ -1,4 +1,4 @@
-# Scalable Fine-tuning from Multiple Data Sources: A First-Order Approximation Approach (EMNLP 2024)
+# Scalable Fine-tuning from Multiple Data Sources: A First-Order Approximation Approach
 - Authors: [Dongyue Li](https://lidongyue12138.github.io/), [Ziniu Zhang](https://ziniuzhang.github.io/), [Lu Wang](https://web.eecs.umich.edu/~wangluxy/) and [Hongyang R. Zhang](https://www.hongyangzhang.com/)
 - Paper: [arXiv]()
 ![pipline](./gradex.png)
@@ -127,9 +127,10 @@ For *instruction fine-tuned model*, use `fast_estimate_linear_regression_alpaca.
 If you find this repository useful or happen to use it in a research paper, please our work with the following bib information
 
 ```
-@article{Li2023scalable,
+@article{Li2024scalable,
   title={Scalable Fine-tuning from Multiple Data Sources: A First-Order Approximation Approach},
-  author={Li, Dongyue and Zhang, Ziniu and Wang, Lu and Zhang, Hongyang},
-  journal={EMNLP},
+  author={Li, Dongyue and Zhang, Ziniu and Wang, Lu and Zhang, Hongyang R},
+  journal={EMNLP Findings},
+  year={2024},
 }
 ```
