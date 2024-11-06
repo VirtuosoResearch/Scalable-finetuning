@@ -123,6 +123,12 @@ For *instruction fine-tuned model*, use `fast_estimate_linear_regression_alpaca.
 - Forward selection: Use `fast_estimate_forward_selection.py` to conduct greedy forward selection to select a subset of data
 - Random ensemble: Please refer to `./notebook/select_random_ensemble.py` for an example of estimating random ensemble scores and thresholding the scores for selection. 
 
+## Examples
+
+We provide examples for illustrating the use cases of our algorithm:
+- Select correct examples from a noisy synthetic dataset: `examples/example_noisy_synthetic_addition_task.ipynb`
+
+
 ## Reference
 If you find this repository useful or happen to use it in a research paper, please our work with the following bib information
 
