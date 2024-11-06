@@ -126,7 +126,7 @@ For *instruction fine-tuned model*, use `fast_estimate_linear_regression_alpaca.
 ## Examples
 
 We provide examples for illustrating the use cases of our algorithm:
-- Select correct examples from a noisy synthetic dataset: `examples/example_noisy_synthetic_addition_task.ipynb`
+- Select correct examples from a noisy synthetic dataset: [`examples/example_noisy_synthetic_addition_task.ipynb`](https://github.com/VirtuosoResearch/Scalable-finetuning/blob/main/examples/example_noisy_synthetic_addition_task.ipynb)
 
 
 ## Reference
