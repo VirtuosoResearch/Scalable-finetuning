@@ -231,73 +231,89 @@ def compute_metrics(predictions, references, xlingual=False):
     return metrics
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--predictions", required=True, help="Path to predictions file.")
-    parser.add_argument("--track", choices=["default", "xlingual"], default="default", 
-        help="default track or xlingual track. For xlingual, we need to use a different tokenizer."
-    )
-    parser.add_argument("--compute_per_category_metrics", action="store_true", help="Compute metrics on every evaluation category.")
-    parser.add_argument("--compute_per_task_metrics", action="store_true", help="Compute metrics on every evaluation task.")
-    return parser.parse_args()
+# def parse_args():
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument("--predictions", required=True, help="Path to predictions file.")
+#     parser.add_argument("--track", choices=["default", "xlingual"], default="default", 
+#         help="default track or xlingual track. For xlingual, we need to use a different tokenizer."
+#     )
+#     parser.add_argument("--compute_per_category_metrics", action="store_true", help="Compute metrics on every evaluation category.")
+#     parser.add_argument("--compute_per_task_metrics", action="store_true", help="Compute metrics on every evaluation task.")
+#     return parser.parse_args()
 
 
-# if __name__ == "__main__":
-    # args = parse_args()
-    # with open(args.predictions) as fin:
-    #     examples = [json.loads(l) for l in fin]
+class MetricTracker:
+    def __init__(self, *keys, writer=None):
+        self.writer = writer
+        self._data = pd.DataFrame(index=keys, columns=['total', 'counts', 'average'])
+        self.reset()
 
-    # predictions = [e["prediction"] for e in examples]
-    # references = [e["Instance"]["output"] for e in examples]
-    # tasks = []
-    # for e in examples:
-    #     if e["Task"] == "task121_atomic_question_rewriting":
-    #         e["Task"] = "task121_zest_question_rewriting"
-    #     tasks.append(e["Task"])
+    def reset(self):
+        for col in self._data.columns:
+            self._data[col].values[:] = 0
 
-    # results = compute_metrics(predictions, references, xlingual=args.track == "xlingual")
-    # print("======== Overall Metrics ========")
-    # print("all_rougeL", results["rougeL"])
-    # print("all_EM", results["exact_match"])
-    # print()
+    def update(self, key, value, n=1):
+        if self.writer is not None:
+            self.writer.add_scalar(key, value)
+        self._data.total[key] += value * n
+        self._data.counts[key] += n
+        if self._data.counts[key] > 0:
+            self._data.average[key] = self._data.total[key] / self._data.counts[key]
+        else:
+            self._data.average[key] = 0
+
+    def avg(self, key):
+        return self._data.average[key]
+
+    def result(self):
+        return dict(self._data.average)
+
+def compute_accuracy(predictions, references, task_indices=None):
+    assert len(predictions) == len(references), f"# of predictions {len(predictions)} doesn't match # of references {len(references)}."
+    xlingual = False
+    if task_indices is None:
+        task_indices = [None] * len(predictions)
+        metrics = {"accuracy": 0, "edit_distance": 0}
+    else:
+        metrics = {f"{task_name}_accuracy": 0 for task_name in task_indices[0].keys()}
+        metrics.update({f"{task_name}_edit_distance": 0 for task_name in task_indices[0].keys()})
+        metrics.update({f"{task_name}_num_samples": 0 for task_name in task_indices[0].keys()})
     
-    # category_metrics = [
-    #     ("Textual Entailment", "exact_match"),
-    #     ("Cause Effect Classification", "exact_match"),
-    #     ("Coreference Resolution", "exact_match"),
-    #     ("Dialogue Act Recognition", "exact_match"),
-    #     ("Answerability Classification", "exact_match"),
-    #     ("Word Analogy", "exact_match"),
-    #     ("Overlap Extraction", "rougeL"),
-    #     ("Keyword Tagging", "rougeL"),
-    #     ("Question Rewriting", "rougeL"),
-    #     ("Title Generation", "rougeL"),
-    #     ("Data to Text", "rougeL"),
-    #     ("Grammar Error Correction", "rougeL"),
-    # ]
-    # category_metrics = {"_".join(category.lower().split()): metric for category, metric in category_metrics}
-
-    # if args.compute_per_category_metrics:
-    #     print("======== Metrics per category ========")
-    #     task_category = {}
-    #     for task in set(tasks):
-    #         with open(os.path.join("./data/tasks/", task+".json")) as fin:
-    #             task_data = json.load(fin)
-    #             task_category[task] = "_".join(task_data["Categories"][0].lower().split())
-    #     categories = [task_category[e["Task"]] for e in examples] 
-    #     results.update(compute_grouped_metrics(predictions, references, categories, xlingual=args.track=="xlingual"))
-        
-    #     for category, metric in category_metrics.items():
-    #         # category = "_".join(category.lower().split())
-    #         if f"{metric}_for_{category}" in results:
-    #             print(f"{metric}_for_{category}", results[f"{metric}_for_{category}"])
-    #     print()
-            
-    # if args.compute_per_task_metrics:
-    #     print("======== Metrics per task ========")
-    #     results_by_task = compute_grouped_metrics(predictions, references, tasks, xlingual=args.track=="xlingual")
-    #     for task in sorted(list(set(tasks))):
-    #         category = task_category[task]
-    #         metric = category_metrics[category]
-    #         print(task, results_by_task[f"{metric}_for_{task}"])
-    #     print()
+    for pred, gold, task_idx in zip(predictions, references, task_indices):
+        assert isinstance(gold, list)
+        if task_idx is None:
+            metrics["accuracy"] += metric_max_over_ground_truths(
+                exact_match_score, prediction=pred, ground_truths=gold, xlingual=xlingual
+            )
+            metrics["edit_distance"] += metric_max_over_ground_truths(
+                edit_distance_score, prediction=pred, ground_truths=gold, xlingual=xlingual
+            )
+        else:
+            # task_idx is dict
+            for task_name, idx in task_idx.items():
+                if len(idx) == 0:
+                    continue
+                tmp_accuracy = metric_max_over_ground_truths(
+                    exact_match_score, prediction=pred, ground_truths=gold, xlingual=xlingual, indices = idx
+                )
+                tmp_edit_distance = metric_max_over_ground_truths(
+                    edit_distance_score, prediction=pred, ground_truths=gold, xlingual=xlingual, indices = idx
+                )
+                metrics[f"{task_name}_accuracy"] += tmp_accuracy
+                metrics[f"{task_name}_edit_distance"] += tmp_edit_distance
+                metrics[f"{task_name}_num_samples"] += 1
+    
+    if task_indices is None:
+        metrics["accuracy"] = 100.0 * metrics["accuracy"] / len(references)
+        metrics["edit_distance"] = metrics["edit_distance"] / len(references)
+    else:
+        for key, val in metrics.items():
+            if "accuracy" in key:
+                task_name = "_".join(key.split("_")[:-1])
+                metrics[key] = (100.0 * val / metrics[f"{task_name}_num_samples"]) if metrics[f"{task_name}_num_samples"] > 0 else 0
+            elif "edit_distance" in key:
+                task_name = "_".join(key.split("_")[:-2])
+                metrics[key] = (val / metrics[f"{task_name}_num_samples"]) if metrics[f"{task_name}_num_samples"] > 0 else 0
+    metrics = {k: round(v, 4) for k, v in metrics.items()}
+    return metrics
+    
