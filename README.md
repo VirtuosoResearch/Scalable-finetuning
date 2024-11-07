@@ -7,11 +7,11 @@
 
 ## Overview
 
-This code implements a fast method for **Es**timation of fine-tuning model losses using **Grad**ients (GradEx). Given a list subsets of tasks, this method can estimate the LM fine-tuning losses on the subsets, without repeated model fine-tuning. It trades off the repeated model fine-tuning with solving logistic regression using gradients as features. It can be applied in subset selection problems to perform task/data selection in fine-tuning language models. We provide the code for experiments of chain-of-thought fine-tuning and intruction fine-tuning.
+This code implements a fast method for the **Es**timation of fine-tuning model losses using **Grad**ients (GradEx). Given a list of subsets of tasks, this method can estimate the LM fine-tuning losses on the subsets, without repeated model fine-tuning. It trades off the repeated model fine-tuning with solving logistic regression using gradients as features. It can be applied in subset selection problems to perform task/data selection in fine-tuning language models. We provide the code for experiments of chain-of-thought fine-tuning and instruction fine-tuning.
 
 ### Requirements
 
-To build up the environment, please run following commands.
+To build up the environment, please run the following commands.
 
 ```bash
 conda create -n gradex python=3.10
@@ -38,7 +38,7 @@ python setup.py develop
 
 - FLAN v2: Please refer to the [open-instruct repository](https://github.com/allenai/open-instruct) for downloading the FLAN v2 (and COT) instruction fine-tuning data. 
 
-After downloading, save the data set as pickle file under the `./data/alpaca_data` folder.  For example: 
+After downloading, save the datasets as pickle files under the `./data/alpaca_data` folder.  For example: 
 
 ```python
 from datasets import load_dataset
@@ -71,25 +71,25 @@ Our algorithm contains the following steps:
 
 #### Meta Training:
 
-This step fine-tune a language model on the combination of all tasks. 
+This step fine-tunes a language model on the combination of all tasks. 
 
 - Use `custom_train_cot.py` to fine-tune LMs on the chain-of-thought data. 
 
 - Use `custom_train_instruction.py` to fine-tune LMs on the instruction fine-tuning data. Use `--train_instruction` to load the FLAN v2 dataset. Without `--train_instruction`, it will load the Alpaca dataset. 
 
-We provide scripts examples under `scripts/meta_training_**.sh`. 
+We provide bash script examples under `scripts/meta_training_**.sh`. 
 
 **Evaluating and projecting gradients** on all training samples: 
 
 - For chain-of-thought fine-tuning, use `fast_estimate_compute_gradients_cot.py`. Use `--load_model_dir` to specify a saved checkpoint directory as the base model. Specify `--project_dim` as the number of projections. 
 
-- For instruction fine-tuning, use `fast_estimate_eval_approximation_instruction.py`. Use `--train_instruction` to load the FLAN v2 or Alpaca datasets. Use `--compute_pretrained_outputs` to compute the gradients. The parameters is similar to the file above. 
+- For instruction fine-tuning, use `fast_estimate_eval_approximation_instruction.py`. Use `--train_instruction` to load the FLAN v2 or Alpaca datasets. Use `--compute_pretrained_outputs` to compute the gradients. The parameters are similar to the file above. 
 
 We provide bash script examples under `scripts/fast_estimate_gradients_**.sh`. These files will save the projection matrix and all projected gradients under a `./gradients/` folder. Please create the folder before usage. 
 
 #### Estimation:
 
-We solve linear regression using the gradients collected above as features to estimate the output of model fine-tuned on a subset of tasks. 
+We solve linear regression using the gradients collected above as features to estimate the output of the model fine-tuned on a subset of tasks. 
 
 - For chain-of-thought fine-tuning, use `fast_estimate_linear_model_cot.py`. Specify `--save_name` for the file to save the evaluation results of estimated models. Specify `--number_of_subsets` and `--subset_size` to control the number and size of sampled subsets
 
@@ -99,7 +99,7 @@ We provide bash script examples under `scripts/fast_estimate_logistic_regression
 
 #### Selection:
 - Forward stepwise selection: please refer to `utils/fast_estimate_forward_selection.py` to conduct forward selection to select a subset of data. 
-- Random ensemble: Please refer to `utils/select_random_ensemble.py` for an example of estimating random ensemble scores. Then, we apply a threshold (or can be viewed as top-k selection) to the scores to select a subset of tasks. 
+- Random ensemble: Please refer to `utils/select_random_ensemble.py` for an example of estimating random ensemble scores. Then, we apply a threshold (or can be viewed as the top-k selection) to the scores to select a subset of tasks. 
 
 
 ## Examples
