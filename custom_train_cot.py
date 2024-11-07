@@ -345,16 +345,6 @@ if __name__ == "__main__":
 
         # evaluate the best checkpoint
         if args.epochs > 0:
-            # lm = lm.load_from_checkpoint(checkpoint_callback.best_model_path, 
-            #                             model=model, tokenizer=tokenizer, 
-            #                             model_type=model_type, completion_metadata=cm)
-            # test_loader = data_module.test_dataloader()
-            # outputs = []; lm.model.eval()
-            # for batch_idx, batch in enumerate(test_loader):
-            #     batch = {k: v.to(lm.device) for k, v in batch.items()}
-            #     batch_output = lm.validation_step(batch, batch_idx)
-            #     outputs.append(batch_output)
-            # summary = evaluate(outputs, lm, tokenizer)
             if args.use_qlora:
                 from lightning_fabric.utilities.cloud_io import _load as pl_load
                 checkpoint = pl_load(checkpoint_callback.best_model_path, map_location=lm.device)

@@ -185,20 +185,10 @@ def main(args):
                 continue
             gradient_dim += param.numel()
 
-    # if args.create_projection:
-    #     if os.path.exists(f"./gradients/{args.dataset_key}_{args.model_key}_{args.preset_key}_{args.project_dim}/projection_matrix_{args.run}.npy"):
-    #         print("Loading projection matrix")
-    #         matrix_P = np.load(f"./gradients/{args.dataset_key}_{args.model_key}_{args.preset_key}_{args.project_dim}/projection_matrix_{args.run}.npy")
-    #     else:
     np.random.seed(args.run)
     project_dim = args.project_dim
     project_matrix = (2 * np.random.randint(2, size=(gradient_dim, project_dim)) - 1).astype(float)
     project_matrix *= 1 / np.sqrt(project_dim)
-    # np.save(f"./gradients/{args.dataset_key}_{args.model_key}_{args.preset_key}_{args.project_dim}/projection_matrix_{args.run}.npy", matrix_P)
-    # else:
-    #     idx = args.run % 10
-    #     print("Loading projection matrix: ", idx)
-    #     matrix_P = np.load(f"./gradients/{args.dataset_key}_{args.model_key}_{args.preset_key}_{args.project_dim}/projection_matrix_{idx}.npy")
 
     lm = lm.to(device)
     lm.model.eval()

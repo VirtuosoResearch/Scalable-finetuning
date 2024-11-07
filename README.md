@@ -1,36 +1,42 @@
 # Scalable Fine-tuning from Multiple Data Sources: A First-Order Approximation Approach
 - Authors: [Dongyue Li](https://lidongyue12138.github.io/), [Ziniu Zhang](https://ziniuzhang.github.io/), [Lu Wang](https://web.eecs.umich.edu/~wangluxy/) and [Hongyang R. Zhang](https://www.hongyangzhang.com/)
 - Paper: [arXiv]()
+
 ![pipline](./gradex.png)
 
 
 ## Overview
 
-This code provides the implementation to conduct gradient-based (first-order) estimation for fine-tuned language models. The experiments involve intruction fine-tuning and chain-of-thought fine-tuning. 
-
-This project has been accepted by EMNLP 2024 Finding.
+This code implements a fast method for **Es**timation of fine-tuning model losses using **Grad**ients (GradEx). Given a list subsets of tasks, this method can estimate the LM fine-tuning losses on the subsets, without repeated model fine-tuning. It trades off the repeated model fine-tuning with solving logistic regression using gradients as features. It can be applied in subset selection problems to perform task/data selection in fine-tuning language models. We provide the code for experiments of chain-of-thought fine-tuning and intruction fine-tuning.
 
 ### Requirements
 
 To build up the environment, please run following commands.
 
 ```bash
-conda create -n sfmd python=3.10
-conda activate sfmd
+conda create -n gradex python=3.10
+conda activate gradex
+
 pip install -r requirements.txt 
 pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124  # check the correct version for pytorch nightly about CUDA
+
 mkdir ./data
 mkdir ./results
 mkdir ./external_lightning_logs
+
 python setup.py develop
 ```
 
 ### Data Preparation
 
-**Instruction fine-tuning**. Please refer to the open instruct repository for downloading the instruction fine-tuning data:
+**Chain-of-thought fine-tuning.** Please refer to the [reasoning-teacher repository](https://github.com/itsnamgyu/reasoning-teacher) for downloading the chain-of-thought data, including CommonsenseQA and StartegyQA. 
 
-- FLAN v2
-- COT
+**Instruction fine-tuning**. 
+
+- Alpaca: Please download the data from [this link](https://github.com/HazyResearch/skill-it/blob/main/aux_data/alpaca_final.pkl) and put the pickle file under the `./data/alpaca_data` folder.  
+
+
+- FLAN v2: Please refer to the [open-instruct repository](https://github.com/allenai/open-instruct) for downloading the FLAN v2 (and COT) instruction fine-tuning data. 
 
 After downloading, save the data set as pickle file under the `./data/alpaca_data` folder.  For example: 
 
@@ -53,75 +59,48 @@ flan_dataset_df = flan_dataset.map(reformat_flan)
 pd.to_pickle(flan_dataset_df, "./flan_dataset.pkl")
 ```
 
-- Alpaca: Download the data from [this link](https://github.com/HazyResearch/skill-it/blob/main/aux_data/alpaca_final.pkl) and put the pickle file under the `./data/alpaca_data` folder.  
-
-**Chain-of-thought fine-tuning.** Please refer to the [reasoning teacher repository](https://github.com/itsnamgyu/reasoning-teacher) for downloading the chain-of-thought data, including CommonsenseQA and StartegyQA. 
 
 ### Usage
 
-Our algorithm contains four steps:
+Our algorithm contains the following steps:
 
-1. **Meta-training**: This fine-tune a language model on the combination of all tasks:
-
-Use `custom_train.py` to fine-tune LMs on the chain-of-thought data. For example
-
-```bash
-python custom_train.py --dataset_key strategy_qa --model_key flan_t5_base --train_key ft_cot \
-    --preset_key ft_cot_t70_64aug --devices 1 --batch_size 8 --inference_batch_size 32 \
-    --train_lora --lora_rank 16 --lora_alpha 128 --runs 8
-```
+1. **Meta training**: Multitask training on all tasks to obtain a meta-initialization. Then, we evaluate and project the gradients of all training samples on the meta-initialization. 
+2. **Estimation**: Estimate model fine-tuning performances on a list of task subsets using projected gradients as features in logistic regression. 
+3. **Selection**: Using the estimated results to conduct subset selection, including forward stepwise selection and random ensemble. 
 
 
-Use `custom_train_alpaca.py` to fine-tune LMs on the instruction fine-tuning data. For example:
+#### Meta Training:
 
-```bash
-python custom_train_alpaca.py --train_instruction --model_key TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T\
-    --lr 2e-5 --batch_size 128 --max_length 256 --epochs 10\
-    --train_lora --lora_rank 128 --lora_alpha 512\
-    --strategy fsdp --devices 0 1 2 3 --runs 1 --precision 16 --accumulate 1
-```
+This step fine-tune a language model on the combination of all tasks. 
 
-2. **Compute the projected gradients** on each training data sample of all tasks. 
+- Use `custom_train_cot.py` to fine-tune LMs on the chain-of-thought data. 
 
-For *chain-of-thought fine-tuning*, use `fast_estimate_compute_gradients.py`. 
+- Use `custom_train_instruction.py` to fine-tune LMs on the instruction fine-tuning data. Use `--train_instruction` to load the FLAN v2 dataset. Without `--train_instruction`, it will load the Alpaca dataset. 
 
-- Specify `--project_dim` as the number of projections. 
-- Use `--load_model_dir` to specify a saved checkpoint directory as the base model. 
+We provide scripts examples under `scripts/meta_training_**.sh`. 
 
-This file will save the projection matrix and all projected gradients under a `./gradients/` folder. Please create the folder before usage. 
+**Evaluating and projecting gradients** on all training samples: 
 
-```bash
-python fast_estimate_compute_gradients.py --dataset_key strategy_qa --model_key flan_t5_base --preset_key ft_cot_t70_64aug\
-			--load_model_dir flan_t5_base_strategy_qa_ft_cot_t70_64aug_lora_r_16_new_run_0/epoch_epoch=17\
-     --train_lora --lora_rank 16 --lora_alpha 128 \
-     --run 0 --project_dim 100 --device 2 
-```
+- For chain-of-thought fine-tuning, use `fast_estimate_compute_gradients_cot.py`. Use `--load_model_dir` to specify a saved checkpoint directory as the base model. Specify `--project_dim` as the number of projections. 
 
-For *instruction fine-tuned model*, use `fast_estimate_eval_approximation_alpaca.py`. Use `--compute_pretrained_outputs` to compute the gradients. The parameters would be the similar as above. 
+- For instruction fine-tuning, use `fast_estimate_eval_approximation_instruction.py`. Use `--train_instruction` to load the FLAN v2 or Alpaca datasets. Use `--compute_pretrained_outputs` to compute the gradients. The parameters is similar to the file above. 
 
-3. **Estimation based on linear regression on gradients** to estimate the output of model fine-tuned on a subset of tasks. 
+We provide bash script examples under `scripts/fast_estimate_gradients_**.sh`. These files will save the projection matrix and all projected gradients under a `./gradients/` folder. Please create the folder before usage. 
 
-For *chain-of-thought fine-tuning*, use `fast_estimate_linear_model.py`. 
+#### Estimation:
 
-- Specify `--save_name` for the file to save the evaluation results of estimated models. 
-- Specify `--number_of_subsets` and `--subset_size` to control the number and size of sampled subsets
+We solve linear regression using the gradients collected above as features to estimate the output of model fine-tuned on a subset of tasks. 
 
-Inside the file, one can modify the subsets collection file under `./sampled_tasks/` to specify the sampled subsets of tasks. Usually, it should be randomly sampled subsets. 
+- For chain-of-thought fine-tuning, use `fast_estimate_linear_model_cot.py`. Specify `--save_name` for the file to save the evaluation results of estimated models. Specify `--number_of_subsets` and `--subset_size` to control the number and size of sampled subsets
 
-```bash
-python fast_estimate_linear_regression.py --dataset_key strategy_qa --model_key flan_t5_base --preset_key ft_cot_t70_64aug\
-    --load_model_dir flan_t5_base_strategy_qa_ft_cot_t70_64aug_lora_r_16_new_run_0/epoch_epoch=17\
-    --train_lora --lora_rank 16 --lora_alpha 128 \
-    --run 0 --project_dim 100 --device 1 \
-    --load_clusters --num_clusters 100 --number_of_subsets 1000 --subset_size 0.5 --scale 0.4
-```
+- For instruction fine-tuning, use `fast_estimate_linear_regression_alpaca.py`.  The parameters is similar to the above. 
 
-For *instruction fine-tuned model*, use `fast_estimate_linear_regression_alpaca.py`.  The parameters would be the similar as above. 
+We provide bash script examples under `scripts/fast_estimate_logistic_regression_**.sh`. Inside the files, one can modify the subsets collection file under `./sampled_tasks/` to specify the sampled subsets of tasks. Normally, it should be randomly sampled subsets. 
 
-4. **Selection**: 
+#### Selection:
+- Forward stepwise selection: please refer to `utils/fast_estimate_forward_selection.py` to conduct forward selection to select a subset of data. 
+- Random ensemble: Please refer to `utils/select_random_ensemble.py` for an example of estimating random ensemble scores. Then, we apply a threshold (or can be viewed as top-k selection) to the scores to select a subset of tasks. 
 
-- Forward selection: Use `fast_estimate_forward_selection.py` to conduct greedy forward selection to select a subset of data
-- Random ensemble: Please refer to `./notebook/select_random_ensemble.py` for an example of estimating random ensemble scores and thresholding the scores for selection. 
 
 ## Examples
 
