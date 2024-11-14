@@ -28,6 +28,8 @@ import pandas as pd
 from collections import defaultdict
 import time
 
+from adapters import AutoAdapterModel,list_adapters, BnConfig
+
 logging.basicConfig(level=logging.INFO)
 
 # torch.set_float32_matmul_precision("high")
@@ -80,10 +82,12 @@ def add_result_to_csv(result_datapoint, file_name):
         result_df.to_csv(file_name)   
 
 def initialize_model(args):
+    model_key = args.model_key.replace("/", "-").replace("..", "")
     if "gpt" in args.model_key or "Llama" in model_key \
         or "bloomz" in model_key or "gemma" in model_key or "Mistral" in model_key:
         hf_key = args.model_key.replace("_", "-")
         tokenizer = AutoTokenizer.from_pretrained(hf_key)
+        tokenizer.padding_side = 'right'
         if args.use_qlora:
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -103,7 +107,7 @@ def initialize_model(args):
         model_type = "encoder_decoder"
         append_eos = False  # t5 tokenizers already append eos
     else:
-        raise NotImplementedError(args.model_key)
+        raise NotImplementedError(args.model_key)    
     
     if args.train_lora:
         if args.model_key == "gpt2": # for gpt2, we generally use full model
@@ -144,6 +148,7 @@ def initialize_model(args):
             )
         model = get_peft_model(model, config)
         model.print_trainable_parameters()
+
     return model, tokenizer, hf_key, model_type, append_eos
 
 if __name__ == "__main__":
@@ -185,6 +190,8 @@ if __name__ == "__main__":
     parser.add_argument('--sam_unnormalize', action="store_true")
 
     parser.add_argument("--freeze_head", action="store_true")
+    
+    parser.add_argument("--use_adapter", action="store_true")
     
     # Additional operations 
     parser.add_argument("--project_gradients", action="store_true")
@@ -264,7 +271,7 @@ if __name__ == "__main__":
         data_module.setup(stage="fit")
         task_name = "_".join(data_module.skills[:5])[:100]
         default_root_dir = os.path.join("external_lightning_logs", 
-                                        ("Instruction__{}".format(model_key) if args.train_instruction else "Alpaca_{}".format(model_key)) + \
+                                        ("Instruction_{}".format(model_key) if args.train_instruction else "Alpaca_{}".format(model_key)) + \
                                         (f"_lora_r_{args.lora_rank}" if args.train_lora else "") + \
                                         (f"_{args.save_name}" if args.save_name else "") + \
                                         (f"_sam_rho_{args.sam_rho}" if args.train_sam else "") + \
@@ -305,23 +312,20 @@ if __name__ == "__main__":
             strategy = "auto"
 
 
-        if args.use_qlora:
-            from lightning.pytorch.plugins import BitsandbytesPrecision
-            # this will pick out the compute dtype automatically, by default `bfloat16`
-            quant_precision = BitsandbytesPrecision(mode="nf4-dq")
-            trainer = pl.Trainer(accelerator="gpu", devices=args.devices, strategy=strategy,
-                                default_root_dir=default_root_dir, min_epochs=args.epochs, max_epochs=args.epochs,
-                                accumulate_grad_batches=args.accumulate, # precision=args.precision,
-                                enable_checkpointing=args.enable_checkpointing,
-                                callbacks=[checkpoint_callback], plugins=quant_precision
-                                )
-        else:
-            trainer = pl.Trainer(accelerator="gpu", devices=args.devices, strategy=strategy,
-                                default_root_dir=default_root_dir, min_epochs=args.epochs, max_epochs=args.epochs,
-                                accumulate_grad_batches=args.accumulate, precision=args.precision,
-                                enable_checkpointing=args.enable_checkpointing,
-                                callbacks=[checkpoint_callback]
-                                )
+        
+        trainer = pl.Trainer(accelerator="gpu", devices=args.devices, strategy=strategy,
+                            default_root_dir=default_root_dir, min_epochs=args.epochs, max_epochs=args.epochs,
+                            accumulate_grad_batches=args.accumulate, precision=args.precision,
+                            enable_checkpointing=args.enable_checkpointing,
+                            callbacks=[checkpoint_callback]
+                            )
+        if args.train_lora:
+            if not os.path.exists(default_root_dir):
+                os.makedirs(default_root_dir)
+            model_path = default_root_dir + "/initial_weights.pt"
+            state_dict = model.state_dict()
+            state_dict = {k: v.clone() for k, v in state_dict.items() if "lora" in k}
+            torch.save(state_dict, model_path)
         if args.use_wandb:
             run_name = ("Instruction__{}".format(model_key) if args.train_instruction else "Alpaca_{}".format(model_key)) + \
                     (f"_lr_{args.lr}_batch_{args.batch_size}") + \
@@ -338,6 +342,13 @@ if __name__ == "__main__":
         print(f"Training time: {end_time - start_time}")
         if args.use_wandb:
             wandb.finish()
+
+        if args.train_lora:
+            from lightning_fabric.utilities.cloud_io import _load as pl_load
+            checkpoint = pl_load(checkpoint_callback.best_model_path, map_location=lm.device)
+            state_dict = checkpoint["state_dict"]
+            state_dict = {k[6:]: v for k, v in state_dict.items() if "lora" in k}
+            torch.save(state_dict, checkpoint_callback.best_model_path.replace(".ckpt", ".pt"))
 
         # evaluate the best checkpoint
         start_time = time.time()
@@ -383,6 +394,10 @@ if __name__ == "__main__":
             if key not in metrics:
                 metrics[key] = []
             metrics[key].append(summary[key])
+
+        # delete the whole model checkpoint and only keep the lora parameters
+        if args.train_lora or args.train_adapter:
+            os.system(f"rm {checkpoint_callback.best_model_path}")
     
     for key in metrics:
         logging.info(f"{key}: {np.mean(metrics[key])} +/- {np.std(metrics[key])}")
