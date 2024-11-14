@@ -27,6 +27,13 @@ mkdir ./external_lightning_logs
 python setup.py develop
 ```
 
+### Examples
+
+We provide stand-alone examples for illustrating the use cases of our algorithm:
+- Select correct examples from a noisy synthetic dataset: [`examples/example_noisy_synthetic_addition_task.ipynb`](https://github.com/VirtuosoResearch/Scalable-finetuning/blob/main/examples/example_noisy_synthetic_addition_task.ipynb)
+- Estimate Llama-3-8B model fine-tuning losses: [`example_approximate_llama_finetuning_loss.ipynb`](https://github.com/VirtuosoResearch/Scalable-finetuning/blob/main/examples/example_approximate_llama_finetuning_loss.ipynb)
+
+
 ### Data Preparation
 
 **Chain-of-thought fine-tuning.** Please refer to the [reasoning-teacher repository](https://github.com/itsnamgyu/reasoning-teacher) for downloading the chain-of-thought data, including CommonsenseQA and StartegyQA. 
@@ -100,13 +107,6 @@ We provide bash script examples under `scripts/fast_estimate_logistic_regression
 #### Selection:
 - Forward stepwise selection: please refer to `utils/fast_estimate_forward_selection.py` to conduct forward selection to select a subset of data. 
 - Random ensemble: Please refer to `utils/select_random_ensemble.py` for an example of estimating random ensemble scores. Then, we apply a threshold (or can be viewed as the top-k selection) to the scores to select a subset of tasks. 
-
-
-## Examples
-
-We provide examples for illustrating the use cases of our algorithm:
-- Select correct examples from a noisy synthetic dataset: [`examples/example_noisy_synthetic_addition_task.ipynb`](https://github.com/VirtuosoResearch/Scalable-finetuning/blob/main/examples/example_noisy_synthetic_addition_task.ipynb)
-
 
 ## Reference
 If you find this repository useful or happen to use it in a research paper, please our work with the following bib information
